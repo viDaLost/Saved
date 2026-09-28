@@ -1,4 +1,4 @@
-"""Telegram Business selective media inbox (Python 3.10+, stdlib only).
+"""Telegram Business selective message inbox (Python 3.10+, stdlib only).
 
 Setup:
   1. Create a bot with @BotFather, enable Business Mode in its settings.
@@ -13,8 +13,8 @@ Example on macOS/Linux:
   python3 business_media_bot.py
 
 To select a message, reply to it in the business chat (swipe right and send
-any reply). The bot sends only the media you replied to, not every incoming
-media message. The source must be present in reply_to_message with a file_id.
+any reply). The bot sends only the message you replied to, not every incoming
+message. The source must be present in reply_to_message.
 Telegram may omit reply_to_message for ephemeral messages. This bot does not
 access view-once, expiring or protected content.
 The bot does not write media or tokens to disk. Keep the token secret.
@@ -80,23 +80,59 @@ def api(method, **params):
     return result["result"]
 
 
-def media_payload(message):
-    """Return (method, file field, file_id), or None for unsupported media."""
+def message_payload(message):
+    """Return (send method, parameters) for a selected message, if supported."""
     if message.get("has_protected_content"):
         return None
+    if message.get("text"):
+        params = {"text": message["text"]}
+        if message.get("entities"):
+            params["entities"] = message["entities"]
+        return "sendMessage", params
     photo = message.get("photo")
     if photo:
-        return "sendPhoto", "photo", photo[-1]["file_id"]
+        media = "sendPhoto", {"photo": photo[-1]["file_id"]}
+    else:
+        media = None
     for key, method in (
         ("video", "sendVideo"),
         ("audio", "sendAudio"),
         ("voice", "sendVoice"),
         ("video_note", "sendVideoNote"),
         ("document", "sendDocument"),
+        ("animation", "sendAnimation"),
+        ("sticker", "sendSticker"),
     ):
         item = message.get(key)
         if item and item.get("file_id"):
-            return method, key, item["file_id"]
+            media = method, {key: item["file_id"]}
+            break
+    if media:
+        method, params = media
+        if method not in ("sendVideoNote", "sendSticker") and message.get("caption"):
+            params["caption"] = message["caption"]
+            if message.get("caption_entities"):
+                params["caption_entities"] = message["caption_entities"]
+        return method, params
+    if message.get("venue"):
+        venue = message["venue"]
+        return "sendVenue", {key: venue[key] for key in ("latitude", "longitude", "title", "address")}
+    if message.get("location"):
+        location = message["location"]
+        return "sendLocation", {key: location[key] for key in ("latitude", "longitude")}
+    if message.get("contact"):
+        contact = message["contact"]
+        params = {key: contact[key] for key in ("phone_number", "first_name")}
+        for key in ("last_name", "vcard"):
+            if contact.get(key):
+                params[key] = contact[key]
+        return "sendContact", params
+    if message.get("dice"):
+        return "sendMessage", {"text": f"Бросок {message['dice']['emoji']}: {message['dice']['value']}"}
+    if message.get("poll"):
+        poll = message["poll"]
+        options = "\n".join(f"• {option['text']}" for option in poll.get("options", []))
+        return "sendMessage", {"text": f"Опрос: {poll['question']}\n{options}"}
     return None
 
 
@@ -109,7 +145,7 @@ def handle(update):
         if direct.get("text", "").split(maxsplit=1)[0:1] == ["/id"]:
             api("sendMessage", chat_id=chat_id, text=f"Ваш Telegram ID: {sender_id}")
         elif OWNER_ID and sender_id == OWNER_ID and direct.get("text", "").startswith("/start"):
-            api("sendMessage", chat_id=chat_id, text="Бот готов. Подключите его в настройках Telegram Business. Чтобы сохранить обычное медиа, ответьте на него в бизнес-чате (свайпом и любым сообщением). Только выбранное медиа придёт сюда.")
+            api("sendMessage", chat_id=chat_id, text="Бот готов. Подключите его в настройках Telegram Business. Чтобы сохранить сообщение, ответьте на него в бизнес-чате (свайпом и любым сообщением). Только выбранное сообщение придёт сюда.")
 
     connection = update.get("business_connection")
     if connection:
@@ -137,15 +173,13 @@ def handle(update):
         return
     if str(original.get("from", {}).get("id")) == OWNER_ID:
         return
-    item = media_payload(original)
+    item = message_payload(original)
     if not item:
         return
-    method, key, file_id = item
-    payload = {"chat_id": int(OWNER_ID), key: file_id}
-    if key != "video_note" and original.get("caption"):
-        payload["caption"] = original["caption"][:1024]
+    method, payload = item
+    payload["chat_id"] = int(OWNER_ID)
     api(method, **payload)
-    logging.info("Delivered selected %s from business chat %s", key, message["chat"]["id"])
+    logging.info("Delivered selected message via %s from business chat %s", method, message["chat"]["id"])
 
 
 def main():
