@@ -50,7 +50,7 @@ def start_health_server():
 
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path != "/health":
+            if self.path not in ("/", "/health"):
                 self.send_error(404)
                 return
             self.send_response(200)
