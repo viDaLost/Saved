@@ -80,10 +80,93 @@ def api(method, **params):
     return result["result"]
 
 
-def message_payload(message):
-    """Return (send method, parameters) for a selected message, if supported."""
-    if message.get("has_protected_content"):
+MESSAGE_KINDS = (
+    ("text", "текст"),
+    ("photo", "фото"),
+    ("video", "видео"),
+    ("audio", "аудио"),
+    ("voice", "голосовое сообщение"),
+    ("video_note", "кружочек"),
+    ("document", "документ"),
+    ("animation", "GIF"),
+    ("sticker", "стикер"),
+    ("paid_media", "платное медиа"),
+    ("story", "история"),
+    ("venue", "место"),
+    ("location", "геопозиция"),
+    ("contact", "контакт"),
+    ("dice", "бросок кубика"),
+    ("poll", "опрос"),
+    ("checklist", "список задач"),
+    ("game", "игра"),
+    ("invoice", "счёт"),
+    ("giveaway", "розыгрыш"),
+    ("giveaway_winners", "итоги розыгрыша"),
+)
+
+
+def message_kind(message):
+    for key, title in MESSAGE_KINDS:
+        if message.get(key):
+            return title
+    return "сообщение"
+
+
+def sender_name(message):
+    user = message.get("from") or message.get("sender_chat") or {}
+    name = " ".join(filter(None, (user.get("first_name"), user.get("last_name")))) or user.get("title", "")
+    if user.get("username"):
+        name = f"{name} (@{user['username']})" if name else f"@{user['username']}"
+    return name or "неизвестный отправитель"
+
+
+def paid_media_payload(message):
+    """Paid media is sendable only when Telegram exposes its purchased file."""
+    items = message["paid_media"].get("paid_media", [])
+    if len(items) != 1:
         return None
+    item = items[0]
+    if item.get("type") == "photo" and item.get("photo"):
+        return "sendPhoto", {"photo": item["photo"][-1]["file_id"]}
+    if item.get("type") == "video" and item.get("video", {}).get("file_id"):
+        return "sendVideo", {"video": item["video"]["file_id"]}
+    return None
+
+
+def text_fallback(message):
+    """Describe a message that cannot be copied as is, keeping all readable text."""
+    lines = [f"{message_kind(message).capitalize()} от {sender_name(message)}"]
+    if message.get("has_protected_content"):
+        lines.append("Содержимое защищено от копирования, Telegram не отдаёт его боту.")
+    if message.get("story"):
+        story = message["story"]
+        username = story.get("chat", {}).get("username")
+        if username:
+            lines.append(f"https://t.me/{username}/s/{story.get('id')}")
+    if message.get("paid_media"):
+        lines.append(f"Стоимость: {message['paid_media'].get('star_count', '?')} ⭐")
+    if message.get("checklist"):
+        checklist = message["checklist"]
+        lines.append(checklist.get("title", ""))
+        lines.extend(f"• {task.get('text', '')}" for task in checklist.get("tasks", []))
+    for key in ("game", "invoice"):
+        if message.get(key):
+            lines.extend(filter(None, (message[key].get("title"), message[key].get("description"))))
+    if message.get("giveaway"):
+        giveaway = message["giveaway"]
+        lines.append(f"Победителей: {giveaway.get('winner_count', '?')}")
+        if giveaway.get("prize_description"):
+            lines.append(giveaway["prize_description"])
+    text = message.get("text") or message.get("caption")
+    if text:
+        lines.append(text)
+    return "sendMessage", {"text": "\n".join(line for line in lines if line)[:4096]}
+
+
+def message_payload(message):
+    """Return (send method, parameters) for a selected message."""
+    if message.get("has_protected_content"):
+        return text_fallback(message)
     if message.get("text"):
         params = {"text": message["text"]}
         if message.get("entities"):
@@ -107,6 +190,8 @@ def message_payload(message):
         if item and item.get("file_id"):
             media = method, {key: item["file_id"]}
             break
+    if not media and message.get("paid_media"):
+        media = paid_media_payload(message)
     if media:
         method, params = media
         if method not in ("sendVideoNote", "sendSticker") and message.get("caption"):
@@ -133,7 +218,24 @@ def message_payload(message):
         poll = message["poll"]
         options = "\n".join(f"• {option['text']}" for option in poll.get("options", []))
         return "sendMessage", {"text": f"Опрос: {poll['question']}\n{options}"}
-    return None
+    return text_fallback(message)
+
+
+def deliver(message):
+    """Send the message to the owner; fall back to a text notice if Telegram refuses."""
+    method, payload = message_payload(message)
+    payload["chat_id"] = int(OWNER_ID)
+    try:
+        api(method, **payload)
+    except RuntimeError as exc:
+        if method == "sendMessage":
+            raise
+        logging.warning("Could not copy message via %s (%s); sending text instead", method, exc)
+        method, payload = text_fallback(message)
+        payload["text"] = f"{payload['text']}\n\nНе удалось переслать файл: {exc}"[:4096]
+        payload["chat_id"] = int(OWNER_ID)
+        api(method, **payload)
+    return method
 
 
 def handle(update):
@@ -171,14 +273,7 @@ def handle(update):
     original = message.get("reply_to_message")
     if not original or not original.get("message_id"):
         return
-    if str(original.get("from", {}).get("id")) == OWNER_ID:
-        return
-    item = message_payload(original)
-    if not item:
-        return
-    method, payload = item
-    payload["chat_id"] = int(OWNER_ID)
-    api(method, **payload)
+    method = deliver(original)
     logging.info("Delivered selected message via %s from business chat %s", method, message["chat"]["id"])
 
 
