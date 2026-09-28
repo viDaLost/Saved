@@ -14,9 +14,8 @@ Example on macOS/Linux:
 
 To select a message, reply to it in the business chat (swipe right and send
 any reply). The bot sends only the message you replied to, not every incoming
-message. The source must be present in reply_to_message.
-Telegram may omit reply_to_message for ephemeral messages. This bot does not
-access view-once, expiring or protected content.
+message. The source must be identified in the reply. Telegram may omit the
+original for disappearing media; /debug reports what arrived, without content.
 The bot does not write media or tokens to disk. Keep the token secret.
 """
 
@@ -40,6 +39,7 @@ if OWNER_ID and not OWNER_ID.isdecimal():
 API = f"https://api.telegram.org/bot{TOKEN}/"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 connection_cache = {}
+last_selection = None
 
 
 def start_health_server():
@@ -238,14 +238,56 @@ def deliver(message):
     return method
 
 
+def reply_reference(message):
+    """Use only an external reply pointing to this same business chat."""
+    external = message.get("external_reply") or {}
+    chat = external.get("chat") or {}
+    if chat.get("id") == message.get("chat", {}).get("id"):
+        return external.get("message_id")
+    return None
+
+
+def selection_diagnostic(message, original):
+    """Retain structural flags only, never content, file IDs or chat IDs."""
+    external = message.get("external_reply") or {}
+    return {
+        "reply": bool(original),
+        "reply_id": bool(original and original.get("message_id")),
+        "reply_media": bool(original and any(original.get(k) for k in
+                                    ("photo", "video", "voice", "video_note", "audio", "document"))),
+        "external_reply": bool(external),
+        "external_id_same_chat": bool(reply_reference(message)),
+        "quote": bool(message.get("quote")),
+        "result": "ожидание",
+    }
+
+
+def debug_text():
+    if last_selection is None:
+        return "После запуска не получено ни одно ваше сообщение в подключённом бизнес-чате."
+    labels = {
+        "reply": "Исходное сообщение в ответе",
+        "reply_id": "ID исходного сообщения",
+        "reply_media": "Файл в исходном сообщении",
+        "external_reply": "Внешняя ссылка на ответ",
+        "external_id_same_chat": "ID из того же чата",
+        "quote": "Цитата",
+    }
+    lines = [f"{label}: {'да' if last_selection[key] else 'нет'}" for key, label in labels.items()]
+    lines.append(f"Результат: {last_selection['result']}")
+    return "Последнее ваше сообщение в бизнес-чате:\n" + "\n".join(lines)
+
+
 def handle(update):
-    global OWNER_ID
+    global last_selection
     direct = update.get("message")
     if direct and direct.get("chat", {}).get("type") == "private":
         sender_id = str(direct.get("from", {}).get("id", ""))
         chat_id = direct["chat"]["id"]
         if direct.get("text", "").split(maxsplit=1)[0:1] == ["/id"]:
             api("sendMessage", chat_id=chat_id, text=f"Ваш Telegram ID: {sender_id}")
+        elif OWNER_ID and sender_id == OWNER_ID and direct.get("text", "").split(maxsplit=1)[0:1] == ["/debug"]:
+            api("sendMessage", chat_id=chat_id, text=debug_text())
         elif OWNER_ID and sender_id == OWNER_ID and direct.get("text", "").startswith("/start"):
             api("sendMessage", chat_id=chat_id, text="Бот готов. Подключите его в настройках Telegram Business. Чтобы сохранить сообщение, ответьте на него в бизнес-чате (свайпом и любым сообщением). Только выбранное сообщение придёт сюда.")
 
@@ -271,10 +313,25 @@ def handle(update):
     if str(message.get("from", {}).get("id")) != OWNER_ID or message.get("sender_business_bot") or message.get("is_from_offline"):
         return
     original = message.get("reply_to_message")
-    if not original or not original.get("message_id"):
+    last_selection = selection_diagnostic(message, original)
+    if original and original.get("message_id") and message_payload(original)[0] != "sendMessage":
+        method = deliver(original)
+        last_selection["result"] = method
+        logging.info("Delivered selected message via %s from business chat %s", method, message["chat"]["id"])
         return
-    method = deliver(original)
-    logging.info("Delivered selected message via %s from business chat %s", method, message["chat"]["id"])
+    source_id = (original or {}).get("message_id") or reply_reference(message)
+    if source_id:
+        try:
+            api("copyMessage", chat_id=int(OWNER_ID), from_chat_id=message["chat"]["id"], message_id=source_id)
+            last_selection["result"] = "скопировано через copyMessage"
+            return
+        except RuntimeError:
+            last_selection["result"] = "copyMessage не сработал"
+    if original and original.get("message_id"):
+        method = deliver(original)
+        last_selection["result"] = method if method != "sendMessage" else "доставлен текст или описание"
+    elif not source_id:
+        last_selection["result"] = "Telegram не передал ID исходного сообщения"
 
 
 def main():
