@@ -23,9 +23,11 @@ The bot does not write media or tokens to disk. Keep the token secret.
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -38,6 +40,28 @@ if OWNER_ID and not OWNER_ID.isdecimal():
 API = f"https://api.telegram.org/bot{TOKEN}/"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 connection_cache = {}
+
+
+def start_health_server():
+    """Optional HTTP endpoint required by Timeweb App Platform deployment."""
+    port = os.environ.get("HEALTH_PORT")
+    if not port:
+        return
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/health":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, _format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 def api(method, **params):
@@ -125,6 +149,7 @@ def handle(update):
 
 
 def main():
+    start_health_server()
     if not OWNER_ID:
         logging.warning("OWNER_ID missing; only /id will work until you configure it and restart.")
     offset = None
