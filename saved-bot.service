@@ -1,0 +1,21 @@
+[Unit]
+Description=Saved Telegram Business media bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=savedbot
+Group=savedbot
+WorkingDirectory=/opt/saved-bot
+EnvironmentFile=/etc/saved-bot.env
+ExecStart=/usr/bin/python3 -u /opt/saved-bot/business_media_bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
